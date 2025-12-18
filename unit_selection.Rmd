@@ -7,10 +7,25 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+library(showtext)
+font_add_google("Noto Sans KR", "noto")
+showtext_auto()
+showtext_opts(dpi = 500)
+```
+
+```{r}
+library(readr)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
 ```
 
 ## import
 ```{r}
+
 # 1. 파일 경로 설정 (CSV 파일명은 실제 이름으로 변경해주세요)
 gpkg_path <- "filtered_merged_data.gpkg"
 csv_path  <- "data/emd_2024_merged_final.csv"  # <-- 실제 CSV 파일 경로로 수정 필요
@@ -51,8 +66,8 @@ gdf <- gdf %>% mutate(sgg_code = substr(canon_code, 1, 5))
 TARGET_NAME <- "율곡동"
 TARGET_SGG_CODE <- "47150" # 김천시
 TREATED_RADII <- c(5, 10, 15, 20) # Treated Bands
-MATCH_YEAR <- "Y2007"
-CONTROL_BUFFER_KM <- 5
+MATCH_YEAR <- "Y2013"
+CONTROL_BUFFER_KM <- 20
 
 # =========================================================
 # [Step 1] Treated Units 생성 & 오염된 시군구 추출
@@ -130,10 +145,23 @@ print(paste("제외된 시군구 코드:", paste(excluded_sggs, collapse = ", ")
 # =========================================================
 print("--- [Step 2] Control Units 생성 (Center 포함 원형 버퍼) ---")
 
-target_rank <- gdf %>%
-  filter(canon_name == TARGET_NAME) %>%
-  mutate(pct = percent_rank(get(MATCH_YEAR))) %>%
-  pull(pct)
+gdf2 <- gdf %>%
+  st_make_valid() %>%                 # (선택) 폴리곤 깨진 거 방지
+  { if (st_is_longlat(.)) st_transform(., 5179) else . } %>%  
+  mutate(
+    area_m2  = as.numeric(st_area(geom)),
+    area_km2 = area_m2 / 1e6,
+    pop      = as.numeric(.data[["Y2005"]]),
+    dens     = if_else(area_km2 > 0, pop / area_km2, NA_real_)   # 명/㎢
+  ) %>%
+  ungroup() %>%
+  mutate(pct = percent_rank(dens))
+
+# canon_code가 47150로 시작하는 대상(여러 개면 대표값 선택)
+target_rank <- gdf2 %>%
+  filter(str_starts(as.character(canon_code), "47150")) %>%
+  summarise(target_rank = median(pct, na.rm = TRUE)) %>%  # first() / mean() 등으로 바꿔도 됨
+  pull(target_rank)
 
 create_clean_control_sf <- function(sgg_code_input, all_data, target_rank) {
   sgg_data <- all_data %>% filter(sgg_code == sgg_code_input)
@@ -183,17 +211,23 @@ clean_sggs <- gdf %>%
   distinct(sgg_code) %>%
   pull(sgg_code)
 
+keep_centers <- c("마성면", "풍천면", "청통면", "강동면", 
+                  "병곡면", "성산면", "봉성면", "매전면")
+
 control_all_sf <- clean_sggs %>%
   map_dfr(function(code) {
     create_clean_control_sf(code, gdf, target_rank)
-  }, .progress = TRUE)
+  }, .progress = TRUE) %>%
+  filter(
+    type != "Control Unit" |
+      (type == "Control Unit" & center_name %in% keep_centers)
+  )
 
 # =========================================================
 # [Step 3] 최종 병합 및 sim Matrix 생성
 # =========================================================
 # (1) 병합 (Treated가 무조건 먼저 오도록)
-final_sf <- bind_rows(treated_all_sf, control_all_sf)
-
+final_sf <- bind_rows(treated_all_sf, control_all_sf) 
 # (2) sim Matrix 생성 (Rows: Time, Cols: Units)
 year_cols <- sort(grep("^Y[0-9]+$", names(final_sf), value = TRUE))
 data_part <- final_sf %>% st_drop_geometry() %>% select(all_of(year_cols))
@@ -204,7 +238,7 @@ sim <- as.matrix(sim)
 
 # (3) 파라미터 계산
 bands <- nrow(treated_all_sf)
-t0 <- which(rownames(sim) == MATCH_YEAR)
+t0 <- which(rownames(sim) == MATCH_YEAR) - 1
 
 # =========================================================
 # 결과 출력 및 확인
@@ -225,11 +259,54 @@ cat("   - t0:", t0, "\n")
 cat("==========================================\n")
 ```
 
-```{r}
-library(sf)
-library(dplyr)
-library(purrr)
 
+```{r}
+# =========================================================
+# [Part 2] 지도 시각화 (Map Visualization)
+# =========================================================
+# 배경 지도 (Clean context)
+bg_map <- gdf 
+
+# 시각화
+f1 <- ggplot() +
+  # 1. 배경 (회색)
+  geom_sf(data = bg_map, fill = "gray97", color = "gray90", size = 0.1) +
+  
+  # 2. Control Units (파란색)
+  geom_sf(data = filter(final_sf, type == "Control Unit"),
+          fill = "lightblue", color = "blue", size = 0.1, alpha = 0.5) +
+  
+  # 3. Treated Spillover (밴드별 색상 다르게)
+  # RColorBrewer의 'Reds' 팔레트 활용 (거리별로 채도 차이)
+  geom_sf(data = filter(final_sf, type == "Treated Spillover"),
+          aes(fill = factor(radius_km)), color = "white", size = 0.2, alpha = 0.8) +
+  
+  # 4. Treated Core (가장 진한 빨강 or 검정)
+  geom_sf(data = filter(final_sf, type == "Treated Unit"),
+          fill = "black", color = "white", size = 0.3) +
+  
+  scale_fill_brewer(palette = "Reds", name = "Spillover Radius (km)") +
+  
+  labs(title = "
+       Treated & Control Candidates") +
+  theme_void() +
+  theme(legend.position = "right")
+
+label_sf <- final_sf %>%
+  filter(type %in% c("Control Unit")) %>%   # 필요하면 조정
+  mutate(label_pt = st_point_on_surface(geometry)) %>%
+  st_set_geometry("label_pt")
+  
+
+f1_labeled <- f1 +
+  geom_sf_text(data = label_sf, aes(label = center_name),
+               size = 4, color = "black")
+
+f1_labeled
+ggsave("dataset_fin_labeled.png", f1_labeled, dpi = 500)
+```
+
+```{r}
 # 1. 데이터 로드 및 설정 (기존과 동일)
 file_path <- "final_joined_data.gpkg"
 gdf <- st_read(file_path, quiet = TRUE)
@@ -285,42 +362,86 @@ spillover_details <- bind_rows(detail_list)
 print(spillover_details)
 
 # (옵션) CSV 파일로 저장하여 엑셀에서 확인
-# write.csv(spillover_details, "treated_spillover_members.csv", row.names = FALSE)
+write.csv(spillover_details, "treated_spillover_members.csv", row.names = FALSE, fileEncoding="euc-kr")
 ```
-
 
 ```{r}
-# =========================================================
-# [Part 2] 지도 시각화 (Map Visualization)
-# =========================================================
-# 배경 지도 (Clean context)
-bg_map <- gdf 
+library(sf)
+library(dplyr)
+library(purrr)
+library(stringr)
 
-# 시각화
-ggplot() +
-  # 1. 배경 (회색)
-  geom_sf(data = bg_map, fill = "gray97", color = "gray90", size = 0.1) +
-  
-  # 2. Control Units (파란색)
-  geom_sf(data = filter(final_sf, type == "Control Unit"),
-          fill = "lightblue", color = "blue", size = 0.1, alpha = 0.5) +
-  
-  # 3. Treated Spillover (밴드별 색상 다르게)
-  # RColorBrewer의 'Reds' 팔레트 활용 (거리별로 채도 차이)
-  geom_sf(data = filter(final_sf, type == "Treated Spillover"),
-          aes(fill = factor(radius_km)), color = "white", size = 0.2, alpha = 0.8) +
-  
-  # 4. Treated Core (가장 진한 빨강 or 검정)
-  geom_sf(data = filter(final_sf, type == "Treated Unit"),
-          fill = "black", color = "white", size = 0.3) +
-  
-  scale_fill_brewer(palette = "Reds", name = "Spillover Radius (km)") +
-  
-  labs(title = "Final Dataset Map: Treated Clusters & Controls") +
-  theme_void() +
-  theme(legend.position = "right")
-  
+# ---------------------------------------------------------
+# 0) 준비: gdf / final_sf / excluded_sggs / MATCH_YEAR / CONTROL_BUFFER_KM
+#    (이미 네 스크립트에서 만들어져 있다고 가정)
+# ---------------------------------------------------------
+
+# 1) Control Unit 목록(최종 선택된 것들만)
+control_ids <- final_sf %>%
+  st_drop_geometry() %>%
+  filter(type == "Control Unit") %>%
+  distinct(unit_id, center_sgg, center_name)
+
+# 2) (권장) 버퍼에 넣을 풀은 오염 시군구 제외
+pool_sf <- gdf %>%
+  filter(!canon_code %in% excluded_sggs) %>%
+  st_make_valid()
+
+pool_cent <- st_centroid(pool_sf)
+
+# 3) 각 control별 포함 읍면동 상세내역 만들기
+control_detail_list <- pmap_dfr(
+  control_ids,
+  function(unit_id, center_sgg, center_name) {
+
+    # center_name에 해당하는 읍면동(폴리곤) 가져오기
+    # (동명이 여러 개면 같은 sgg 내에서 우선 선택)
+    center_row <- gdf %>%
+      filter(canon_name == center_name) %>%
+      { if ("sgg_code" %in% names(.)) filter(., sgg_code == center_sgg) else . } %>%
+      slice(1)
+
+    if (nrow(center_row) == 0) {
+      return(tibble(
+        unit_id = unit_id,
+        center_sgg = center_sgg,
+        center_name = center_name,
+        buffer_km = CONTROL_BUFFER_KM,
+        emd_count = NA_integer_,
+        included_emd = NA_character_,
+        included_sggs = NA_character_
+      ))
+    }
+
+    control_zone <- st_buffer(st_geometry(center_row), CONTROL_BUFFER_KM * 1000)
+
+    idx <- st_within(pool_cent, control_zone, sparse = FALSE)[, 1]
+    units_in_buf <- pool_sf[idx, ]
+
+    tibble(
+      unit_id = unit_id,
+      center_sgg = center_sgg,
+      center_name = center_name,
+      buffer_km = CONTROL_BUFFER_KM,
+      emd_count = nrow(units_in_buf),
+      included_emd = paste(sort(units_in_buf$canon_name), collapse = ", "),
+      included_sggs = paste(sort(unique(units_in_buf$sgg_code)), collapse = ", ")
+    )
+  }
+)
+
+# 4) 출력 & 저장
+print(control_detail_list)
+
+write.csv(
+  control_detail_list,
+  "control_members_details.csv",
+  row.names = FALSE,
+  fileEncoding = "euc-kr"
+)
+
 ```
+
 
 ```{r}
 library(ggplot2)
@@ -339,55 +460,95 @@ ts_df <- final_sf %>%
 # y축 최대값 계산 (텍스트 위치 선정을 위해)
 y_max <- max(ts_df$outcome, na.rm = TRUE)
 
-ggplot(ts_df, aes(x = year, y = outcome, group = unit_id)) +
-  # 1. Control Units
-  geom_line(data = filter(ts_df, type == "Control Unit"), 
-            color = "gray80", size = 0.3, alpha = 0.5) +
-  
-  # 2. Treated Spillover
-  geom_line(data = filter(ts_df, type == "Treated Spillover"), 
-            aes(color = factor(radius_km)), size = 1) +
-  
-  # 3. Treated Core
-  geom_line(data = filter(ts_df, type == "Treated Unit"), 
-            color = "black", size = 1.2) +
-  
-  # 4. Vertical Lines
-  geom_vline(xintercept = c(2007, 2015), linetype = "dashed", color = "black", alpha = 0.7) +
-  
-  # 5. Labels (수직선과 겹치지 않게 옆으로 이동)
-  annotate("text", x = 2007, y = y_max, label = "2007", 
-           hjust = -0.2, # 오른쪽으로 약간 이동
-           vjust = 1,    # 위쪽 정렬
-           fontface = "bold", size = 4) +
-  annotate("text", x = 2015, y = y_max, label = "2015", 
-           hjust = -0.2, # 오른쪽으로 약간 이동
-           vjust = 1, 
-           fontface = "bold", size = 4) +
-  
-  # 6. Y축 포맷팅 (콤마 표시, e 제거)
+f2 <- ggplot(ts_df, aes(x = year, y = outcome, group = unit_id)) +
+  geom_line(data = filter(ts_df, type == "Control Unit"),
+            color = "gray80", linewidth = 0.3, alpha = 0.5) +
+  geom_line(data = filter(ts_df, type == "Treated Spillover"),
+            aes(color = factor(radius_km)), linewidth = 1) +
+  geom_line(data = filter(ts_df, type == "Treated Unit"),
+            color = "black", linewidth = 1.2) +
+  geom_vline(xintercept = c(2007, 2013), linetype = "dashed", color = "black", alpha = 0.7) +
+  annotate("text", x = 2007, y = y_max, label = "2007",
+           hjust = -0.2, vjust = 1, fontface = "bold", size = 8) +
+  annotate("text", x = 2013, y = y_max, label = "2013",
+           hjust = -0.2, vjust = 1, fontface = "bold", size = 8) +
   scale_y_continuous(labels = comma) +
-  
   scale_color_brewer(palette = "Reds", name = "Spillover (km)") +
   labs(title = "Time Series Trajectories",
        subtitle = "Black: Core | Red/Orange: Spillovers | Gray: Controls",
        y = "Aggregated Outcome (Population/Value)") +
-  theme_minimal() +
-  theme(
-    legend.position = "right",
-    axis.text = element_text(size = 10),
-    plot.title = element_text(face = "bold", size = 14)
-  )
-```
-```{r}
-# 저장하기
-save(sim, bands, t0, file = "SVR/SVR_input_data.RData")
+  theme_bw(base_size = 14)    # <- 여기서 기본 글자 크기 “기반” 잡고
 
-print("SVR_input_data.RData 파일로 저장되었습니다.")
+f2
+ggsave("time_series_2013.png", f2, width = 12, height = 7, units = "in", dpi = 500)  
+
 ```
 
+## normalization & de-trending
+
 ```{r}
-load("SVR/SVR_input_data.RData")
+## 1) years 추출
+Y <- as.matrix(sim)
+rn <- rownames(Y)
+years <- as.integer(gsub("^[A-Za-z]+", "", rn))
+
+## 2) treated/control 컬럼 구분 (필요하면 여기서 직접 지정해도 됨)
+cn <- colnames(Y)
+
+treated_cols <- cn[1:5]
+
+control_cols <- setdiff(cn, treated_cols)
+
+## 3) pre-treatment 기간 지정
+treat_start_year <- 2013
+pre_idx <- which(years < treat_start_year)
+
+## 4) 유닛별 pre-mean, pre-sd로 표준화
+pre_mean <- colMeans(Y[pre_idx, , drop = FALSE], na.rm = TRUE)
+pre_sd   <- apply(Y[pre_idx, , drop = FALSE], 2, sd, na.rm = TRUE)  # (T0-1) 분모
+
+Y_std <- sweep(Y, 2, pre_mean, FUN = "-")
+Y_std <- sweep(Y_std, 2, pre_sd,   FUN = "/")
+
+## 5) trend_t = control unit들의 시점별 평균 (표준화된 값 기준)
+trend_t <- rowMeans(Y_std[, control_cols, drop = FALSE], na.rm = TRUE)
+
+## 6) 모든 유닛에 대해 detrend: y_it_std - trend_t
+Y_detrended <- sweep(Y_std, 1, trend_t, FUN = "-")
+
+## 7) (선택) 결과를 data.frame으로 정리
+sim_std <- as.data.frame(Y_std)
+sim_std$year <- years
+
+sim_detrended <- as.data.frame(Y_detrended)
+sim_detrended$year <- years
+
+trend_df <- data.frame(year = years, trend = trend_t)
+
+pre_stats <- data.frame(
+  unit = cn,
+  pre_mean = as.numeric(pre_mean),
+  pre_sd   = as.numeric(pre_sd),
+  is_treated = cn %in% treated_cols
+)
+
+sim_orig <- sim
+sim <- sim_detrended %>% select(-year)
+```
+
+```{r}
+pre_stats
+```
+
+## save
+
+```{r}
+save(sim_orig, sim, bands, t0, file = "SVR/SVR_input_data_t2013.RData")
+print("SVR_input_data_t2013.RData 파일로 저장되었습니다.")
+```
+
+```{r}
+load("SVR/SVR_input_data_t2013.RData")
 
 # 확인
 print(dim(sim))
@@ -399,9 +560,7 @@ print(t0)
 
 
 ```{r}
-library(sf)
-library(dplyr)
-library(ggplot2)
+
 
 # 1. 데이터 로드 및 좌표계 설정
 file_path <- "final_joined_data.gpkg"
@@ -521,7 +680,7 @@ for(dist in radii_km) {
 }
 
 # 그래프 그리기
-ggplot() +
+f3 <- ggplot() +
   # 1. 전체 지도 (회색)
   geom_sf(data = gdf, fill = "white", color = "gray80") +
   # 2. 할당된 지역들 색칠 (밴드별로 다른 색)
@@ -536,14 +695,19 @@ ggplot() +
   theme_minimal() +
   labs(title = "지역 중심점(Centroid) 기준 밴드 할당 결과",
        fill = "Distance Band")
-```
 
+f3
+ggsave("band_map.png", f3, dpi=500)
+```
 ```{r}
 library(sf)
 library(dplyr)
 library(purrr)
+library(ggplot2)
 
-# 1. 데이터 로드
+# =========================================================
+# 1. 초기 설정
+# =========================================================
 file_path <- "final_joined_data.gpkg"
 gdf <- st_read(file_path, quiet = TRUE)
 
@@ -551,61 +715,114 @@ if (st_crs(gdf)$epsg != 5179) {
   gdf <- st_transform(gdf, 5179)
 }
 
-# 시군구 코드 생성 (앞 5자리)
+# 시군구 코드 생성
 gdf <- gdf %>% mutate(sgg_code = substr(canon_code, 1, 5))
 
-# ---------------------------------------------------------
-# 2. Treated Zone 정의 및 "오염된 시군구" 식별
-# ---------------------------------------------------------
+# --- 파라미터 ---
 TARGET_NAME <- "율곡동"
-TARGET_SGG <- "47150"    # 김천시
-TREATED_RADIUS_KM <- 12  # Treated Unit 생성 시 사용했던 최대 반경 (가장 넓은 범위 기준)
+TARGET_SGG_CODE <- "47150" # 김천시
+TREATED_RADII <- c(5, 10, 15, 20) # Treated Bands
+MATCH_YEAR <- "Y2013"
+CONTROL_BUFFER_KM <- 0
 
-# (1) 율곡동 형상
+# =========================================================
+# [Step 1] Treated Units 생성 & 오염된 시군구 추출
+# =========================================================
+print("--- [Step 1] Treated Units 생성 및 오염된 시군구 식별 ---")
+
+# 오염된 시군구 목록을 담을 벡터 (김천시는 기본 포함)
+contaminated_sggs <- c(TARGET_SGG_CODE)
+
+# (1) Treated Core (율곡동)
 treated_unit <- gdf %>% filter(canon_name == TARGET_NAME)
 treated_geom <- st_geometry(treated_unit)
 
-# (2) Treated Spillover 영향권 (최대 반경 버퍼)
-treated_influence_zone <- st_buffer(treated_geom, dist = TREATED_RADIUS_KM * 1000)
+treated_core_data <- treated_unit %>% st_drop_geometry() %>% select(starts_with("Y"))
+treated_core_sf <- st_sf(
+  unit_id = "Treated_Core",
+  type = "Treated Unit",
+  center_name = TARGET_NAME,
+  center_sgg = TARGET_SGG_CODE,
+  radius_km = 0,
+  treated_core_data,
+  geometry = treated_geom
+)
 
-# (3) 영향권에 '조금이라도' 걸치는 모든 읍면동 찾기
-# st_intersects: 겹치기만 해도 TRUE
-affected_emds_idx <- st_intersects(gdf, treated_influence_zone, sparse = FALSE)
-affected_emds <- gdf[affected_emds_idx, ]
+# (2) Treated Spillover Bands Loop
+treated_bands_list <- list()
+prev_buffer <- treated_geom
+candidates <- gdf %>% filter(canon_name != TARGET_NAME)
+candidate_centroids <- st_centroid(candidates)
 
-# (4) 제외할 시군구 목록 추출 (Contaminated SGGs)
-# 율곡동 본체, 율곡동 주변부, 그리고 주변부가 속한 시군구 전체를 제외
-excluded_sggs <- unique(affected_emds$sgg_code)
-
-print("=== [제외] Treated Spillover 영향권에 포함된 시군구 목록 ===")
-excluded_names <- gdf %>% 
-  filter(sgg_code %in% excluded_sggs) %>% 
-  pull(sgg_code) %>% 
-  unique()
-print(excluded_names)
-print(paste("총", length(excluded_names), "개의 시군구가 제외됩니다. (김천시 및 인접 시군구)"))
-
-# ---------------------------------------------------------
-# 3. Control Center 매칭 및 Unit 생성 준비
-# ---------------------------------------------------------
-MATCH_YEAR <- "Y2005"
-CONTROL_BUFFER_KM <- 10
-
-# 율곡동의 2005년 인구 분위수 (김천시 내 위상)
-target_rank <- gdf %>%
-  filter(canon_name == TARGET_NAME) %>%
-  mutate(pct = percent_rank(get(MATCH_YEAR))) %>%
-  pull(pct)
-
-# ---------------------------------------------------------
-# 4. 함수: 각 시군구별 Control Unit 생성
-# ---------------------------------------------------------
-create_clean_control <- function(sgg_code_input, all_data, target_rank) {
+for (dist in TREATED_RADII) {
+  # 도넛 영역 생성
+  curr_buffer <- st_buffer(treated_geom, dist * 1000)
+  band_zone <- st_difference(curr_buffer, prev_buffer)
   
-  # (1) 해당 시군구 데이터
+  # 밴드에 포함되는 읍면동 찾기
+  in_band_idx <- st_within(candidate_centroids, band_zone, sparse = FALSE)
+  units_in_band <- candidates[in_band_idx, ]
+  
+  if (nrow(units_in_band) > 0) {
+    # ★ 중요: 밴드에 포함된 읍면동의 소속 시군구(sgg_code)를 오염 목록에 추가
+    contaminated_sggs <- c(contaminated_sggs, unique(units_in_band$sgg_code))
+    
+    # 데이터 합산
+    agg_data <- units_in_band %>% 
+      st_drop_geometry() %>% 
+      summarise(across(starts_with("Y"), sum, na.rm=TRUE))
+    
+    # sf 객체 생성
+    band_sf <- st_sf(
+      unit_id = paste0("Treated_Band_", dist, "km"),
+      type = "Treated Spillover",
+      center_name = TARGET_NAME,
+      center_sgg = TARGET_SGG_CODE,
+      radius_km = dist,
+      agg_data,
+      geometry = st_union(units_in_band)
+    )
+    treated_bands_list[[paste0(dist)]] <- band_sf
+  }
+  prev_buffer <- curr_buffer
+}
+
+# Treated 전체 병합
+treated_all_sf <- bind_rows(treated_core_sf, bind_rows(treated_bands_list))
+
+# (3) 최종 제외 목록 확정 (중복 제거)
+excluded_sggs <- unique(contaminated_sggs)
+
+print(paste("총", length(excluded_sggs), "개의 시군구가 제외됩니다."))
+print(paste("제외된 시군구 코드:", paste(excluded_sggs, collapse = ", ")))
+
+# =========================================================
+# [Step 2] Control Units 생성 (Clean SGGs 대상)
+# =========================================================
+print("--- [Step 2] Control Units 생성 (Center 포함 원형 버퍼) ---")
+
+gdf2 <- gdf %>%
+  st_make_valid() %>%                 # (선택) 폴리곤 깨진 거 방지
+  { if (st_is_longlat(.)) st_transform(., 5179) else . } %>%  
+  mutate(
+    area_m2  = as.numeric(st_area(geom)),
+    area_km2 = area_m2 / 1e6,
+    pop      = as.numeric(.data[["Y2005"]]),
+    dens     = if_else(area_km2 > 0, pop / area_km2, NA_real_)   # 명/㎢
+  ) %>%
+  ungroup() %>%
+  mutate(pct = percent_rank(dens))
+
+# canon_code가 47150로 시작하는 대상(여러 개면 대표값 선택)
+target_rank <- gdf2 %>%
+  filter(str_starts(as.character(canon_code), "47150")) %>%
+  summarise(target_rank = median(pct, na.rm = TRUE)) %>%  # first() / mean() 등으로 바꿔도 됨
+  pull(target_rank)
+
+create_clean_control_sf <- function(sgg_code_input, all_data, target_rank) {
   sgg_data <- all_data %>% filter(sgg_code == sgg_code_input)
   
-  # (2) 매칭: 해당 시군구 내에서 율곡동과 위상이 비슷한 지역(Center) 찾기
+  # a. 매칭 (Center 찾기)
   center_candidate <- sgg_data %>%
     mutate(
       local_percentile = percent_rank(get(MATCH_YEAR)),
@@ -614,81 +831,109 @@ create_clean_control <- function(sgg_code_input, all_data, target_rank) {
     arrange(diff) %>%
     slice(1) 
   
-  # (3) 10km 버퍼 생성 및 Center 제외 (도넛)
+  # b. 버퍼 생성 (★ 수정됨: 도넛 아님, 꽉 찬 원)
   center_geom <- st_geometry(center_candidate)
-  full_buffer <- st_buffer(center_geom, dist = CONTROL_BUFFER_KM * 1000)
-  control_zone <- st_difference(full_buffer, center_geom)
+  control_zone <- st_buffer(center_geom, dist = CONTROL_BUFFER_KM * 1000)
   
-  # (4) 이웃 합산 (Global Search)
-  # 비록 'Center'는 깨끗한 시군구에 있지만, 그 10km 버퍼가 
-  # 혹시라도 제외된 시군구(김천 등)를 침범할 수도 있습니다.
-  # SVR 로직상 'Control Unit의 값'은 주변부의 합이므로, 
-  # 여기서는 단순히 지리적으로 걸리는 모든 이웃을 합산합니다.
-  
-  potential_neighbors <- all_data %>% 
-    filter(canon_name != center_candidate$canon_name)
-  
-  neighbors <- potential_neighbors %>% 
+  # c. 이웃 합산 (★ 수정됨: Center 자신도 포함)
+  # st_filter로 버퍼 내 모든 읍면동 검색 (Center 포함)
+  neighbors <- all_data %>% 
     st_filter(control_zone, .predicate = st_within)
   
   if (nrow(neighbors) > 0) {
     agg_data <- neighbors %>%
       st_drop_geometry() %>%
-      summarise(across(starts_with("Y"), \(x) sum(x, na.rm = TRUE))) %>%
-      mutate(
-        control_id = paste0("Control_", sgg_code_input),
-        center_name = center_candidate$canon_name,
-        center_sgg = sgg_code_input,
-        radius_km = CONTROL_BUFFER_KM,
-        type = "Control Unit"
-      )
-    return(agg_data)
+      summarise(across(starts_with("Y"), \(x) sum(x, na.rm = TRUE)))
+    
+    agg_geom <- st_union(neighbors)
+    
+    st_sf(
+      unit_id = paste0("Control_", sgg_code_input),
+      type = "Control Unit",
+      center_name = center_candidate$canon_name,
+      center_sgg = sgg_code_input,
+      radius_km = CONTROL_BUFFER_KM,
+      agg_data,
+      geometry = agg_geom
+    )
   } else {
-    return(NULL)
+    NULL
   }
 }
 
-# ---------------------------------------------------------
-# 5. 실행: '깨끗한' 시군구에 대해서만 루프
-# ---------------------------------------------------------
-# 전체 시군구 중 제외 목록을 뺀 나머지
-candidate_sggs <- gdf %>%
+clean_sggs <- gdf %>%
   st_drop_geometry() %>%
-  filter(!sgg_code %in% excluded_sggs) %>% # ★ 핵심 필터링 ★
+  filter(!sgg_code %in% excluded_sggs) %>%
   distinct(sgg_code) %>%
   pull(sgg_code)
 
-print(paste("생성할 Control Unit 후보 시군구 수:", length(candidate_sggs)))
+# keep_centers <- c("마성면", "풍천면", "청통면", "강동면", 
+#                   "병곡면", "성산면", "봉성면", "매전면")
 
-# 루프 실행
-final_controls <- candidate_sggs %>%
+control_all_sf <- clean_sggs %>%
   map_dfr(function(code) {
-    create_clean_control(code, gdf, target_rank)
-  }, .progress = TRUE)
+    create_clean_control_sf(code, gdf, target_rank)
+  }, .progress = TRUE) 
 
-# ---------------------------------------------------------
-# 6. 결과 확인 및 시각화 (검증)
-# ---------------------------------------------------------
-print(head(final_controls %>% select(control_id, center_name, Y2005)))
+# =========================================================
+# [Step 3] 최종 병합 및 sim Matrix 생성
+# =========================================================
+# (1) 병합 (Treated가 무조건 먼저 오도록)
+final_sf <- bind_rows(treated_all_sf, control_all_sf) 
+# (2) sim Matrix 생성 (Rows: Time, Cols: Units)
+year_cols <- sort(grep("^Y[0-9]+$", names(final_sf), value = TRUE))
+data_part <- final_sf %>% st_drop_geometry() %>% select(all_of(year_cols))
 
-# (시각화 검증) 제외된 영역과 선택된 Control Center들이 잘 떨어져 있는지 확인
-# 시각화를 위해 Control Center 좌표만 추출 (있는 경우만)
-if(nrow(final_controls) > 0) {
-  control_centers <- gdf %>% 
-    filter(canon_name %in% final_controls$center_name)
-  
-  ggplot() +
-    geom_sf(data = gdf, fill = "gray95", color = "white") + # 배경
-    # 제외된 지역들 (Treated Influence Zone에 걸린 시군구)
-    geom_sf(data = gdf %>% filter(sgg_code %in% excluded_sggs), 
-            fill = "mistyrose", color = "white") +
-    # Treated Unit (율곡동)
-    geom_sf(data = treated_unit, fill = "red", color = "black") +
-    # Control Centers (파란 점)
-    geom_sf(data = control_centers, color = "blue", size = 1) +
-    labs(title = "Treated Exclusion vs Control Centers",
-         subtitle = "빨간색 영역(영향권 시군구)에서는 Control이 생성되지 않음") +
-    theme_minimal()
-}
+sim <- t(data_part) # 전치
+colnames(sim) <- final_sf$unit_id
+sim <- as.matrix(sim)
+
+# (3) 파라미터 계산
+bands <- nrow(treated_all_sf)
+t0 <- which(rownames(sim) == MATCH_YEAR) - 1
+
+# =========================================================
+# 결과 출력 및 확인
+# =========================================================
+cat("\n==========================================\n")
+cat(" >>> Final Dataset Prepared Correctly <<< \n")
+cat("==========================================\n")
+cat("1. Exclusion Logic Check:\n")
+cat("   - Treated Cluster에 포함된 시군구들을 먼저 식별 후 제외함.\n")
+cat("   - 제외된 SGG 개수:", length(excluded_sggs), "\n")
+cat("\n2. sim Matrix Dimensions:", dim(sim), "\n")
+cat("   - Rows (Time):", head(rownames(sim), 2), "...", tail(rownames(sim), 2), "\n")
+cat("   - Cols (Units):", colnames(sim)[1], "...", colnames(sim)[bands], "(Treated)\n")
+cat("                   ", colnames(sim)[bands+1], "...", "(Controls)\n")
+cat("\n3. Parameters:\n")
+cat("   - bands:", bands, "\n")
+cat("   - t0:", t0, "\n")
+cat("==========================================\n")
+```
+
+```{r}
+gdf <- gdf %>% mutate(sgg_code = substr(canon_code, 1, 5))
+
+control_centers <- gdf %>% 
+  filter(canon_name %in% control_all_sf$center_name)
+
+ex <- ggplot() +
+  geom_sf(data = gdf, fill = "gray95", color = "white") + # 배경
+  # 제외된 지역들 (Treated Influence Zone에 걸린 시군구)
+  geom_sf(data = gdf %>% filter(sgg_code %in% excluded_sggs), 
+          fill = "mistyrose", color = "white") +
+  # Treated Unit (율곡동)
+  geom_sf(data = treated_unit, fill = "red", color = "black") +
+  # Control Centers (파란 점)
+  geom_sf(data = control_centers, color = "blue", size = 1) +
+  labs(title = "Treated Exclusion vs Control Centers") +
+  theme_minimal()
+
+ex
+ggsave("exc.png", ex, dpi=500)
+```
+
+```{r}
+
 ```
 

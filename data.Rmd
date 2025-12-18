@@ -6,12 +6,9 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-library(showtext)
-
-# 한글 폰트 추가 (구글 Noto Sans KR)
-font_add_google("Noto Sans KR", "noto")
-showtext_auto()
 knitr::opts_chunk$set(echo = TRUE)
+showtext_auto()
+showtext_opts(dpi = 500)
 ```
 ## library load
 ```{r}
@@ -75,6 +72,9 @@ gdf_processed <- gdf_filtered %>%
       # [병합] 율곡동 통합: 농소면(37030310) -> 율곡동(37030620)
       ADM_CD == "37030310" ~ "37030620",
       
+      # [병합] 율곡동 통합: 남면(37030320) -> 율곡동(37030620)
+      ADM_CD == "37030320" ~ "37030620",
+      
       # [병합] 강남동 통합: 서구동(37040620) -> 강남동(37040630)
       ADM_CD == "37040620" ~ "37040630",
       
@@ -89,6 +89,7 @@ gdf_processed <- gdf_filtered %>%
     GROUP_NM = case_when(
       ADM_CD == "37580350" ~ "금수면", # 이름은 유지하거나 필요시 변경
       ADM_CD == "37030310" ~ "율곡동",
+      ADM_CD == "37030320" ~ "율곡동",
       ADM_CD == "37040620" ~ "강남동",
       ADM_CD == "37100570" ~ "서부1동",
       TRUE ~ ADM_NM
@@ -149,7 +150,7 @@ library(sf)
 gdf_joined$Y2024 <- as.numeric(gsub(",", "", as.character(gdf_joined$Y2024)))
 
 # 2. 단계구분도 그리기
-ggplot(data = gdf_joined) +
+g1 <- ggplot(data = gdf_joined) +
   # (1) 지오메트리 설정: fill에 Y2024 변수를 매핑
   geom_sf(aes(fill = Y2024), color = "white", lwd = 0.1) + 
   
@@ -161,14 +162,18 @@ ggplot(data = gdf_joined) +
   # (3) 디자인 다듬기
   theme_void() + # 배경의 위경도 숫자와 그리드 제거 (깔끔하게)
   labs(
-    title = "2024년 행정동별 총인구",
-    subtitle = "경상북도(영양/청송/울릉 제외) + 충청북도 영동군 + 대구광역시 군위군",
+    title = "2024년 읍면동별 총인구",
+    subtitle = "경상북도(영양/청송/울릉 제외) + 영동군 + 군위군",
     caption = "Data Source: 행정안전부,「주민등록인구현황」"
   ) +
   theme(
     legend.position = "right",
     plot.title = element_text(hjust = 0.5, face = "bold", size = 15)
   )
+
+g1
+
+ggsave("eda.png", g1, dpi=500)
 ```
 
 ```{r}
