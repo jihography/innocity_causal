@@ -1,0 +1,3 @@
+[submodule "SVR"]
+	path = SVR
+	url = https://github.com/jihography/SVR.git
